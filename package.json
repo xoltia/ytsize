@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "tiny-async-pool": "^2.1.0",
-    "youtubei": "latest"
+    "youtubei": "latest",
+    "youtubei.js": "^8.2.0"
   }
 }

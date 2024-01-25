@@ -1,5 +1,12 @@
 import { Innertube, YT } from 'youtubei.js';
 import { parseArgs } from 'util';
+import {
+    formatSize,
+    audioFormatToString,
+    videoFormatToString,
+    getAudioFormat,
+    getVideoFormat
+} from './format';
 import asyncPool from 'tiny-async-pool';
 
 const { values: args } = parseArgs({
@@ -9,9 +16,26 @@ const { values: args } = parseArgs({
     options: {
         channel: {
             'type': 'string',
+        },
+        'gen-script-template': {
+            'type': 'string',
+            'short': 'g',
+        },
+        plugin: {
+            'type': 'string',
+            'short': 'p',
+        },
+        'streams': {
+            'type': 'boolean',
+            'short': 's',
         }
     }
 });
+
+if (args['gen-script-template']) {
+    await createPluginScript(args['gen-script-template']);
+    process.exit(0);
+}
 
 if (!args.channel) throw Error("Channel not specified");
 
@@ -19,12 +43,15 @@ const youtube = await Innertube.create();
 const channel = await youtube.getChannel(args.channel);
 if (!channel) throw Error("Channel not found");
 
-type StreamFeed = Awaited<ReturnType<typeof channel.getLiveStreams>> | YT.ChannelListContinuation;
+const feedFunc = args.streams ?
+    channel.getLiveStreams.bind(channel) :
+    channel.getVideos.bind(channel);
+
+type StreamFeed = Awaited<ReturnType<typeof feedFunc>> | YT.ChannelListContinuation;
 type FeedVideo = StreamFeed['videos'][number];
-type Format = NonNullable<Awaited<ReturnType<typeof youtube.getInfo>>['streaming_data']>['formats'][number];
 
 const feedVids: FeedVideo[] = [];
-let feed: StreamFeed = await channel.getLiveStreams();
+let feed: StreamFeed = await feedFunc();
 let videoChunk: FeedVideo[] = feed.videos;
 
 while (videoChunk.length > 0) {
@@ -48,27 +75,26 @@ const availableVids = feedVids.filter(video => {
 console.log(`Found ${availableVids.length} available videos`);
 
 const videos = asyncPool(10, availableVids, async video => youtube.getInfo(video.key('id').string()));
+const plugin = args.plugin ? await import(args.plugin) : null;
 
 let size = 0;
 
 for await (const info of videos) {
-    // if (video.key('is_upcoming').isBoolean() && video.key('is_upcoming').boolean()) continue;
-    // if (video.key('is_live').isBoolean() && video.key('is_live').boolean()) continue;
-
-    // const info = await youtube.getInfo(video.key('id').string());
-
     const formats = [
         ...(info.streaming_data?.formats ?? []),
         ...(info.streaming_data?.adaptive_formats ?? []),
     ];
 
-    const format = getVideoFormat(formats);
+    let videoFunc = plugin?.getVideoFormat ?? getVideoFormat;
+    let audioFunc = plugin?.getAudioFormat ?? getAudioFormat;
+
+    const format = videoFunc(formats);
     if (!format) {
         console.log(`No video format found for ${info.basic_info.id}`);
         continue;
     }
 
-    const audioFormat = getAudioFormat(formats);
+    const audioFormat = audioFunc(formats);
     if (!audioFormat) {
         console.log(`No audio format found for ${info.basic_info.id}`);
         continue;
@@ -98,120 +124,57 @@ for await (const info of videos) {
 const totalSizeGB = size / 1024 / 1024 / 1024;
 console.log(`Total size for all videos: ${size} bytes (${totalSizeGB} GB)`);
 
-function formatSize(format: Format): number {
-    if (format.content_length) return format.content_length;
-    return format.bitrate / 8 * format.approx_duration_ms / 1000;
+async function createPluginScript(outpath: string) {
+    const content = `
+/**
+ * This function will override the default video format selector
+ * and will select the highest quality video format available.
+ * 
+ * @typedef {Object} Format
+ * @property {number} itag
+ * @property {string} mime_type
+ * @property {boolean} is_type_otf
+ * @property {number} bitrate
+ * @property {number | undefined} average_bitrate
+ * @property {number} width
+ * @property {number} height
+ * @property {{ start: number, end: number } | undefined} init_range
+ * @property {{ start: number, end: number } | undefined} index_range
+ * @property {Date} last_modified
+ * @property {number | undefined} content_length
+ * @property {string | undefined} quality
+ * @property {string | undefined} quality_label
+ * @property {number | undefined} fps
+ * @property {string | undefined} url
+ * @property {string | undefined} cipher
+ * @property {string | undefined} signature_cipher
+ * @property {string | undefined} audio_quality
+ * @property {{ audio_is_default: boolean, display_name: string, id: string } | undefined} audio_track
+ * @property {number} approx_duration_ms
+ * @property {number | undefined} audio_sample_rate
+ * @property {number | undefined} audio_channels
+ * @property {number | undefined} loudness_db
+ * @property {boolean} has_audio
+ * @property {boolean} has_video
+ * @property {string | null | undefined} language
+ * @property {boolean | undefined} is_dubbed
+ * @property {boolean | undefined} is_descriptive
+ * @property {boolean | undefined} is_original
+ * @property {{ primaries: string | undefined, transfer_characteristics: string | undefined, matrix_coefficients: string | undefined } | undefined} color_info
+ * 
+ * @typedef {(formats: Format[]) => Format | null} FormatSelector
+ **/
+
+/** @type {FormatSelector} */
+function getVideoFormat(formats) {
+    return null;
 }
 
-function videoFormatToString(format: Format): string {
-    return `${format.quality_label ?? format.quality ?? 'unknown'} ${format.width}x${format.height} ${format.fps}fps ${format.bitrate}bps ${format.mime_type ?? 'unknown'}`;
+/** @type {FormatSelector} */
+function getAudioFormat(formats) {
+    return null;
 }
+`
 
-function audioFormatToString(format: Format): string {
-    return `${format.audio_quality ?? 'unknown'} ${format.audio_sample_rate ?? 'unknown'}Hz ${format.audio_channels ?? 'unknown'}ch ${format.bitrate}bps ${format.mime_type ?? 'unknown'}`;
+    await Bun.write(outpath, content);
 }
-
-function getAudioFormat(formats: Format[]): Format | null {
-    const codecOrder = ['mp4a', 'aac', 'vorbis', 'opus', 'mp3', 'ac3', 'dts'].reverse();
-    // find audio only formats
-    const audioFormats = formats.filter(format => format.has_audio && !format.has_video);
-    if (audioFormats.length === 0) return null;
-
-    audioFormats.sort((a, b) => {
-        const audioQualities = [
-            'AUDIO_QUALITY_LOW',
-            'AUDIO_QUALITY_MEDIUM',
-            'AUDIO_QUALITY_HIGH',
-        ];
-
-        if (a.audio_quality && b.audio_quality) {
-            const aq = audioQualities.indexOf(a.audio_quality);
-            const bq = audioQualities.indexOf(b.audio_quality);
-            if (aq !== bq) return bq - aq;
-        }
-
-        if (a.audio_channels !== b.audio_channels) return b.audio_channels! - a.audio_channels!;
-        if (a.audio_sample_rate !== b.audio_sample_rate) return b.audio_sample_rate! - a.audio_sample_rate!;
-
-        //console.log(a.mime_type, b.mime_type);
-        // ex: audio/webm; codecs="opus"
-
-        let aCodec = a.mime_type?.split(';')[1]?.split('=')[1]?.replace(/"/g, '');
-        let bCodec = b.mime_type?.split(';')[1]?.split('=')[1]?.replace(/"/g, '');
-
-        for (const codec of codecOrder) {
-            if (aCodec.indexOf(codec) !== -1) aCodec = codec;
-            if (bCodec.indexOf(codec) !== -1) bCodec = codec;
-        }
-
-        if (aCodec && bCodec) {
-            const aCodecIndex = codecOrder.indexOf(aCodec);
-            const bCodecIndex = codecOrder.indexOf(bCodec);
-            if (aCodecIndex !== bCodecIndex) return aCodecIndex - bCodecIndex;
-        } else if (aCodec) {
-            return -1;
-        } else if (bCodec) {
-            return 1;
-        }
-
-        return 0;
-    });
-
-    return audioFormats.shift()!;
-}
-
-function getVideoFormat(formats: Format[]): Format | null {
-    const codecOrder = ['h264', 'h265', 'vp9', 'vp9.2', 'av01', 'vp8',  'h263', 'theora'].reverse();
-    // find video only formats
-    const videoFormats = formats.filter(format => format.has_video && !format.has_audio);
-    if (videoFormats.length === 0) return null;
-    // sort by quality,res,fps,codec
-    videoFormats.sort((a, b) => {
-        if (a.quality_label && b.quality_label) {
-            const aq = a.quality_label.split('p')[0];
-            const bq = b.quality_label.split('p')[0];
-            if (aq !== bq) return parseInt(bq) - parseInt(aq);
-        }
-
-        if (a.width !== b.width) return b.width - a.width;
-        if (a.height !== b.height) return b.height - a.height;
-        if (a.fps !== b.fps) return b.fps! - a.fps!;
-
-        //console.log(a.mime_type, b.mime_type);
-        // ex: video/webm; codecs="vp9"
-
-        const codecMap = new Map<string, string>([
-            ['avc1', 'h264'],
-            ['avc3', 'h264'],
-            ['vp9', 'vp9'],
-            ['vp8', 'vp8'],
-            ['mp4v', 'h263'],
-            ['theora', 'theora'],
-        ]);
-
-        let aCodec = a.mime_type?.split(';')[1]?.split('=')[1]?.replace(/"/g, '');
-        let bCodec = b.mime_type?.split(';')[1]?.split('=')[1]?.replace(/"/g, '');
-
-        for (const [key, value] of codecMap.entries()) {
-            if (aCodec.indexOf(key) !== -1) aCodec = value;
-            if (bCodec.indexOf(key) !== -1) bCodec = value;
-        }
-
-        if (aCodec && bCodec) {
-            const aCodecIndex = codecOrder.indexOf(aCodec);
-            const bCodecIndex = codecOrder.indexOf(bCodec);
-            // console.log(aCodecIndex, bCodecIndex);
-            // console.log(aCodec, bCodec);
-            if (aCodecIndex !== bCodecIndex) return aCodecIndex - bCodecIndex;
-        } else if (aCodec) {
-            return -1;
-        } else if (bCodec) {
-            return 1;
-        }
-
-        return 0;
-    });
-
-    return videoFormats.shift()!;
-}
-
