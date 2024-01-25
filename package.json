@@ -1,0 +1,16 @@
+{
+  "name": "ytsize",
+  "module": "index.ts",
+  "type": "module",
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/tiny-async-pool": "^2.0.3"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "tiny-async-pool": "^2.1.0",
+    "youtubei": "latest"
+  }
+}
