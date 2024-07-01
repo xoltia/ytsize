@@ -1,4 +1,4 @@
-import { Innertube, YT } from 'youtubei.js';
+import { Innertube, YT } from 'youtubei.js/web';
 import { parseArgs } from 'util';
 import {
     formatSize,
